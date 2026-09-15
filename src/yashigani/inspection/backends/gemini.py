@@ -21,6 +21,7 @@ from yashigani.inspection.backend_base import (
 )
 from yashigani.inspection.classification_prompt import (
     SYSTEM_PROMPT,
+    build_user_message,
     parse_classification_response,
 )
 
@@ -107,7 +108,7 @@ class GeminiBackend(ClassifierBackend):
                 system_instruction=SYSTEM_PROMPT,
             )
             response = model_instance.generate_content(
-                content,
+                build_user_message(content),
                 request_options={"timeout": self._timeout},
             )
             raw = response.text

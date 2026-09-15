@@ -23,6 +23,7 @@ from yashigani.inspection.backend_base import (
 )
 from yashigani.inspection.classification_prompt import (
     SYSTEM_PROMPT,
+    build_user_message,
     parse_classification_response,
 )
 
@@ -66,7 +67,7 @@ class LMStudioBackend(ClassifierBackend):
             "model": self._model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": content},
+                {"role": "user", "content": build_user_message(content)},
             ],
             "temperature": 0.0,
             "max_tokens": 256,

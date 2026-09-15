@@ -22,6 +22,7 @@ from yashigani.inspection.backend_base import (
 )
 from yashigani.inspection.classification_prompt import (
     SYSTEM_PROMPT,
+    build_user_message,
     parse_classification_response,
 )
 
@@ -120,7 +121,7 @@ class AzureOpenAIBackend(ClassifierBackend):
                 model=self._deployment_name,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": content},
+                    {"role": "user", "content": build_user_message(content)},
                 ],
                 max_tokens=self._max_tokens,
                 temperature=0.0,

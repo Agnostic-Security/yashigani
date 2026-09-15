@@ -12,7 +12,6 @@ legacy plain path (dev/test).
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
 
@@ -25,6 +24,7 @@ from yashigani.inspection.backend_base import (
 )
 from yashigani.inspection.classification_prompt import (
     SYSTEM_PROMPT,
+    build_user_message,
     parse_classification_response,
 )
 
@@ -108,11 +108,7 @@ class OllamaBackend(ClassifierBackend):
         """POST to /api/chat and return the model's message content string."""
         from yashigani.inspection._ollama_transport import ollama_post_json
 
-        user_message = (
-            "USER_CONTENT_START\n"
-            + json.dumps(content)  # JSON-encode to escape special chars
-            + "\nUSER_CONTENT_END"
-        )
+        user_message = build_user_message(content)
         payload = {
             "model": self._model,
             "messages": [
