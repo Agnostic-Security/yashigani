@@ -11,7 +11,10 @@ In K8s: endpoints are the per-pod DNS names from the headless Service:
 """
 from __future__ import annotations
 
-from yashigani.inspection._ollama_transport import resolve_engine_url
+from yashigani.inspection._ollama_transport import (
+    resolve_engine_model,
+    resolve_engine_url,
+)
 import logging
 import os
 import threading
@@ -128,7 +131,7 @@ class OllamaPool(ClassifierBackend):
             endpoints = [ep.strip() for ep in pool_env.split(",") if ep.strip()]
         else:
             endpoints = [resolve_engine_url()]
-        model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+        model = resolve_engine_model()
         return cls(endpoints=endpoints, model=model)
 
     def classify(self, content: str) -> ClassifierResult:

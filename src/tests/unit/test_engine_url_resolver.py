@@ -22,7 +22,9 @@ from pathlib import Path
 import pytest
 
 from yashigani.inspection._ollama_transport import (
+    DEFAULT_ENGINE_MODEL,
     DEFAULT_ENGINE_URL,
+    resolve_engine_model,
     resolve_engine_url,
 )
 
@@ -36,6 +38,9 @@ def _clear(monkeypatch: pytest.MonkeyPatch) -> None:
         "KUROSHIO_BASE_URL",
         "YASHIGANI_OLLAMA_URL",
         "OLLAMA_BASE_URL",
+        "YASHIGANI_KUROSHIO_MODEL",
+        "KUROSHIO_MODEL",
+        "OLLAMA_MODEL",
     ):
         monkeypatch.delenv(n, raising=False)
 
@@ -107,5 +112,48 @@ def test_no_module_resolves_the_engine_url_independently() -> None:
     offenders = [h for h in hits if "_ollama_transport.py" not in h]
     assert not offenders, (
         "the engine URL must be resolved ONLY by resolve_engine_url(); "
+        "these read it directly:\n  " + "\n  ".join(offenders)
+    )
+
+
+# --- the MODEL pivot: same problem, and the 5.0 -> 6.0 stitch depends on it ---
+
+
+@pytest.mark.parametrize("name", ["YASHIGANI_KUROSHIO_MODEL", "KUROSHIO_MODEL"])
+def test_kuroshio_model_names_are_read(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    monkeypatch.setenv(name, "qwen3.8:27b")
+    assert resolve_engine_model() == "qwen3.8:27b"
+
+
+def test_deprecated_model_name_still_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")
+    assert resolve_engine_model() == "qwen2.5:7b"
+
+
+def test_new_model_name_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OLLAMA_MODEL", "old:1b")
+    monkeypatch.setenv("KUROSHIO_MODEL", "new:27b")
+    assert resolve_engine_model() == "new:27b"
+
+
+def test_model_default_unchanged_by_the_rename(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Licence-ineligible (YSG-RISK-312) and must move before commercial ship —
+    but moving it HERE would bundle a behaviour change into a rename."""
+    assert resolve_engine_model() == DEFAULT_ENGINE_MODEL == "qwen2.5:3b"
+
+
+def test_no_module_resolves_the_engine_model_independently() -> None:
+    """The stitch guard. The default model was hardcoded in FIVE places, two of
+    them licence-ineligible. Five places is five chances to miss one at the
+    5.0 -> 6.0 cutover, and a missed site fails silently — it just keeps
+    serving the old model."""
+    hits = subprocess.run(
+        ["grep", "-rn", "-E", r'getenv\("(YASHIGANI_KUROSHIO_MODEL|KUROSHIO_MODEL|OLLAMA_MODEL)"', str(_SRC)],
+        capture_output=True,
+        text=True,
+    ).stdout.strip().splitlines()
+    offenders = [h for h in hits if "_ollama_transport.py" not in h]
+    assert not offenders, (
+        "the engine model must be resolved ONLY by resolve_engine_model(); "
         "these read it directly:\n  " + "\n  ".join(offenders)
     )

@@ -15,7 +15,10 @@ Last updated: 2026-05-17T00:00:00+00:00
 """
 from __future__ import annotations
 
-from yashigani.inspection._ollama_transport import resolve_engine_url
+from yashigani.inspection._ollama_transport import (
+    resolve_engine_model,
+    resolve_engine_url,
+)
 
 import logging
 import os
@@ -231,7 +234,7 @@ def _bootstrap():
 
     # ── Inspection pipeline ────────────────────────────────────────────────
     ollama_url = resolve_engine_url()
-    model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+    model = resolve_engine_model()
     classifier = PromptInjectionClassifier(model=model, ollama_base_url=ollama_url)
     # A10 (5.0): per-identity classifier concurrency cap (see gateway entrypoint).
     from yashigani.inspection.concurrency_guard import IdentityConcurrencyGuard

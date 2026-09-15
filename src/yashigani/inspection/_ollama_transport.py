@@ -70,6 +70,47 @@ _DEPRECATED_ENGINE_URL_ENVS = frozenset({"YASHIGANI_OLLAMA_URL", "OLLAMA_BASE_UR
 DEFAULT_ENGINE_URL = "http://ollama:11434"
 
 
+# --- single pivot for the engine MODEL ---------------------------------------
+# Same problem, same shape. Four call sites each did
+# `os.getenv("OLLAMA_MODEL", "qwen2.5:3b")` and a fifth defaulted to
+# "gemma3:4b" — so the shipped default model was hardcoded in five places, and
+# BOTH hardcoded values are licence-ineligible (YSG-RISK-312: qwen2.5:3b is
+# `qwen-research`, research-only; D36: gemma3:4b carries the Gemma
+# pass-through obligation).
+#
+# Centralising matters beyond tidiness: it makes the 5.0 -> 6.0 stitch ONE
+# edit instead of five, which is the difference between a clean cutover and
+# five chances to miss one. A missed site does not fail loudly — it quietly
+# keeps serving the old model.
+_ENGINE_MODEL_ENV_PRECEDENCE = (
+    "YASHIGANI_KUROSHIO_MODEL",  # preferred
+    "KUROSHIO_MODEL",            # preferred
+    "OLLAMA_MODEL",              # deprecated, still honoured
+)
+_DEPRECATED_ENGINE_MODEL_ENVS = frozenset({"OLLAMA_MODEL"})
+
+# UNCHANGED for now, deliberately. This is licence-ineligible (YSG-RISK-312)
+# and must move before commercial ship, but moving it here would bundle a
+# behaviour change into a rename. One edit, when the D37 decision is
+# implemented — and now there IS only one edit.
+DEFAULT_ENGINE_MODEL = "qwen2.5:3b"
+
+
+def resolve_engine_model(default: str = DEFAULT_ENGINE_MODEL) -> str:
+    """Resolve the engine model name. Single source of truth for every consumer."""
+    for name in _ENGINE_MODEL_ENV_PRECEDENCE:
+        value = os.getenv(name)
+        if value and value.strip():
+            if name in _DEPRECATED_ENGINE_MODEL_ENVS:
+                logging.getLogger(__name__).warning(
+                    "%s is deprecated; use YASHIGANI_KUROSHIO_MODEL or KUROSHIO_MODEL. "
+                    "The old name still works and will continue to.",
+                    name,
+                )
+            return value.strip()
+    return default
+
+
 def resolve_engine_url(default: str = DEFAULT_ENGINE_URL) -> str:
     """Resolve the inference-engine base URL from the environment.
 

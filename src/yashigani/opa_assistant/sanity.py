@@ -20,7 +20,10 @@ Caddy mesh front).
 """
 from __future__ import annotations
 
-from yashigani.inspection._ollama_transport import resolve_engine_url
+from yashigani.inspection._ollama_transport import (
+    resolve_engine_model,
+    resolve_engine_url,
+)
 
 import json
 import logging
@@ -174,7 +177,7 @@ async def llm_review(rego: str) -> list[dict]:
     """
     from yashigani.inspection._ollama_transport import ollama_async_client
     ollama_url = resolve_engine_url().rstrip("/")
-    model = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL") or os.getenv("OLLAMA_MODEL") or "gemma3:4b"
+    model = os.getenv("YASHIGANI_OPA_ASSISTANT_MODEL") or resolve_engine_model()
     prompt = (
         "You are reviewing an OPA Rego authorization policy for risky logic. In 1-3 short "
         "bullet points, flag ONLY concrete risks: does it block everything, never allow, "

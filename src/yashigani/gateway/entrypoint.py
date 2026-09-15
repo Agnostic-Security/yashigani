@@ -7,7 +7,10 @@ Last updated: 2026-05-17T00:00:00+00:00
 """
 from __future__ import annotations
 
-from yashigani.inspection._ollama_transport import resolve_engine_url
+from yashigani.inspection._ollama_transport import (
+    resolve_engine_model,
+    resolve_engine_url,
+)
 
 import asyncio
 import logging
@@ -198,7 +201,7 @@ def _build_app(mesh_mode: bool = False):
 
     # Inspection pipeline
     ollama_url = resolve_engine_url()
-    model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+    model = resolve_engine_model()
     if "OLLAMA_MODEL" not in os.environ:
         logger.warning("OLLAMA_MODEL not set — using default '%s'", model)
     classifier = PromptInjectionClassifier(model=model, ollama_base_url=ollama_url)
