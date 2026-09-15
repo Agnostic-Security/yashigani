@@ -12,38 +12,35 @@
 # ── Stage 1: llama.cpp CUDA build ───────────────────────────────────────────
 # Base: nvidia/cuda:<CUDA_VER>-devel-ubuntu24.04
 # RESOLVE-DIGEST: run scripts/resolve-and-pin-digests.sh to fill this in.
-FROM nvidia/cuda:12.6.3-devel-ubuntu24.04@sha256:PLACEHOLDER-RESOLVE-AT-BUILD-TIME AS builder
+# ---------------------------------------------------------------------------
+# ARTIFACT STAGE — consume the VERIFIED upstream prebuilt (D25/D26).
+#
+# Replaced a clone + cmake build. Not for convenience: Mac cannot compile a
+# Linux binary and Linux cannot compile a Metal one, so build-per-platform
+# meant two sourcing models and two trust roots for ONE component — the sixth
+# divergence D26 exists to prevent.
+#
+# Fetched and verified OUTSIDE the image by
+# `infer/deploy/scripts/fetch-llama-server.sh --platform ubuntu-cuda-13.3-x64`:
+# release-asset digest against a recorded pin (a tag is not a pin — assets can
+# be replaced in place), the Sigstore build-provenance attestation proving
+# upstream CI built it from the tagged source, the expected backend library,
+# and that the binary does not link libcurl so the engine cannot fetch models
+# itself (D16). Verification lives outside because it needs `gh` and network,
+# neither of which belongs in a build layer.
+ARG KUROSHIO_ARTIFACT_DIR=infer/deploy/artifacts/ubuntu-cuda-13.3-x64
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04@sha256:PLACEHOLDER-RESOLVE-AT-BUILD-TIME AS artifact
+ARG KUROSHIO_ARTIFACT_DIR
+WORKDIR /artifact
+COPY ${KUROSHIO_ARTIFACT_DIR}/ ./
+# Fail closed: an unverified binary must not reach a runtime image merely
+# because a file was in the right directory.
+RUN test -f llama-server || { echo "FATAL: no llama-server in ${KUROSHIO_ARTIFACT_DIR} — run infer/deploy/scripts/fetch-llama-server.sh --platform ubuntu-cuda-13.3-x64 first" >&2; exit 1; } \
+    && test -f llama-server.manifest.json || { echo "FATAL: no artifact manifest — the fetch script did not produce this, refusing" >&2; exit 1; } \
+    && grep -q '"build_provenance_attested": true' llama-server.manifest.json || \
+       { echo "FATAL: manifest records no verified build-provenance attestation — refusing" >&2; exit 1; } \
+    && chmod 0555 llama-server
 
-ARG LLAMA_CPP_TAG=PIN-ME
-ARG LLAMA_CPP_COMMIT_SHA=PIN-ME
-ARG CUDA_ARCHITECTURES="75;80;86;89;90"
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
-
-RUN apt-get update \
-    && apt-get -y --no-install-recommends install \
-        git ca-certificates cmake build-essential ninja-build \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-# Pinned-tag, verified-commit checkout (no `master`/`HEAD` builds — supply-chain finding #7).
-RUN git clone --depth 1 --branch "${LLAMA_CPP_TAG}" https://github.com/ggml-org/llama.cpp.git src \
-    && test "$(git -C src rev-parse HEAD)" = "${LLAMA_CPP_COMMIT_SHA}" || \
-        { echo "FATAL: checked-out commit does not match pinned LLAMA_CPP_COMMIT_SHA — refusing to build" >&2; exit 1; }
-
-WORKDIR /build/src
-RUN cmake -B build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DGGML_NATIVE=OFF \
-        -DGGML_CUDA=ON \
-        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
-        -DLLAMA_CURL=OFF \
-        -DBUILD_SHARED_LIBS=ON \
-    && cmake --build build --config Release -j"$(nproc)" --target llama-server
-
-# ── Stage 2: kuroshio wheel build (pure Python, no torch — pyproject.toml) ──
 FROM python:3.14.5-slim@sha256:7a500125bc50693f2214e842a621440a1b1b9cbb2188f74ab045d29ed2ea5856 AS wheel-builder
 WORKDIR /wheel
 COPY infer/pyproject.toml ./
@@ -64,8 +61,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /build/src/build/bin/llama-server /usr/local/bin/llama-server
-COPY --from=builder /build/src/build/bin/*.so /usr/local/lib/
+COPY --from=artifact /artifact/llama-server /usr/local/bin/llama-server
+COPY --from=artifact /artifact/*.so /usr/local/lib/
 RUN ldconfig
 COPY --from=wheel-builder /dist/*.whl /tmp/
 RUN pip3 install --no-cache-dir --break-system-packages /tmp/*.whl \

@@ -49,6 +49,26 @@ volumes:
   # (Su C4/C5 lane — download atomicity, symlink/allowlist containment — not built here).
   kuroshio_puller_scratch:
 
+# ENGINE IMAGE PINNING (D25/D26).
+#
+# These defaulted to a floating `:local` tag with no digest — so a host could
+# run whatever happened to be tagged `:local` there, with no way to establish
+# which upstream commit produced the running engine. Mac failed obviously (no
+# engine at all); Linux failed silently, which is worse, and it is why the
+# `:local` default is a supply-chain hole rather than a missing convenience.
+#
+# The variables are now REQUIRED — `${VAR:?message}` fails compose with a
+# readable error instead of substituting a tag that resolves to something
+# unknown. Set them to a digest-pinned reference built from a verified
+# artifact:
+#
+#   infer/deploy/scripts/fetch-llama-server.sh --platform ubuntu-x64   # verify
+#   docker build -f infer/deploy/docker/Dockerfile.kuroshio-cpu ...    # build
+#   export YSG_KUROSHIO_PULLER_IMAGE=yashigani/kuroshio-puller@sha256:...
+#
+# Failing closed on an unset variable is deliberate: an engine image nobody can
+# identify is the state this whole sourcing decision exists to end.
+
 services:
   kuroshio-classifier:
     # image: set by the backend overlay (docker-compose.kuroshio.{cuda,rocm,vulkan,cpu}.yml)
@@ -134,7 +154,7 @@ services:
     build:
       context: ../../..
       dockerfile: infer/deploy/docker/Dockerfile.kuroshio-puller
-    image: ${YSG_KUROSHIO_PULLER_IMAGE:-yashigani/kuroshio-puller:local}
+    image: ${YSG_KUROSHIO_PULLER_IMAGE:?YSG_KUROSHIO_PULLER_IMAGE is required and must be digest-pinned (yashigani/kuroshio-puller@sha256:...). The old ':local' default could not identify which upstream commit produced the engine - see D25/D26.}
     restart: unless-stopped
     user: "1002:1002"
     mem_limit: ${YSG_KUROSHIO_PULLER_MEM_LIMIT:-2048m}
@@ -183,7 +203,7 @@ services:
   # ships model-less by design either way.
   kuroshio-init:
     profiles: ["init"]
-    image: ${YSG_KUROSHIO_PULLER_IMAGE:-yashigani/kuroshio-puller:local}
+    image: ${YSG_KUROSHIO_PULLER_IMAGE:?YSG_KUROSHIO_PULLER_IMAGE is required and must be digest-pinned (yashigani/kuroshio-puller@sha256:...). The old ':local' default could not identify which upstream commit produced the engine - see D25/D26.}
     user: "1000:1000"
     restart: "no"
     read_only: true
@@ -261,7 +281,7 @@ services:
     build:
       context: ../../..
       dockerfile: infer/deploy/docker/Dockerfile.kuroshio-first-parse-jail
-    image: ${YSG_KUROSHIO_PARSE_JAIL_IMAGE:-yashigani/kuroshio-first-parse-jail:local}
+    image: ${YSG_KUROSHIO_PARSE_JAIL_IMAGE:?YSG_KUROSHIO_PARSE_JAIL_IMAGE is required and must be digest-pinned (yashigani/kuroshio-first-parse-jail@sha256:...). See D25/D26.}
     network_mode: none
     read_only: true
     user: "1003:1003"
