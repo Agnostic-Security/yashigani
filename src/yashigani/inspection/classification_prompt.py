@@ -70,8 +70,14 @@ def build_user_message(content: str) -> str:
     OBEYING visible injected instructions. It does NOT and cannot address
     content the model cannot SEE — payloads smuggled in Unicode tag/variation-
     selector codepoints render as nothing to the model, so there is no visible
-    instruction to ignore. That class is closed by the deterministic
-    decode-prepass BEFORE the model, never by this prompt.
+    instruction to ignore.
+
+    That class is NOT yet closed. A deterministic decode-prepass BEFORE the
+    model is the REQUIRED fix (YSG-RISK-319) and DOES NOT EXIST on this path
+    today — the red council (2026-09-15) confirmed the smuggled payload is
+    never even escalated to this classifier (suspicion gate scores 0.0), so
+    this prompt is not reached for that class at all. Do not read this
+    docstring as a statement that smuggling is handled; it is not.
 
     Content is json.dumps-escaped between the markers, matching the hardened
     classifier.py reference: a raw payload could otherwise embed its own literal
