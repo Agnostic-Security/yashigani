@@ -226,6 +226,14 @@ UPSTREAM_URL=""
 LICENSE_KEY_PATH=""
 DB_AES_KEY=""                 # YASHIGANI_DB_AES_KEY — set via prompt or --db-aes-key
 NON_INTERACTIVE=false
+# Licence tier. Default COMMUNITY (Tiago 2026-09-15: "during the install you
+# should ask what is the license they are going for, default is Community").
+# Sets concurrency + per-user context together in the engine (YSG-RISK-317) and
+# selects the default model. Both journeys default the same way: the
+# non-interactive path must not silently land on a different tier than the
+# operator would have got by pressing Enter.
+LICENCE_TIER="community"
+LICENCE_TIER_EXPLICIT=false
 # Track whether YSG_RUNTIME was set explicitly by the operator (env var or
 # --runtime CLI flag). When true, prompt_runtime_choice() skips the
 # interactive prompt — the admin has already chosen.
@@ -813,6 +821,12 @@ parse_args() {
         AIR_GAP_BUNDLE="${2:?'--bundle requires a path to the .tar.zst bundle'}"
         shift 2 ;;
       --non-interactive) NON_INTERACTIVE=true;  shift ;;
+      --licence-tier|--license-tier)
+        # Both spellings accepted: the product is British-English but operators
+        # type either, and a rejected flag here costs an install.
+        LICENCE_TIER="${2:?'--licence-tier requires one of: community, smb, enterprise, datacenter'}"
+        LICENCE_TIER_EXPLICIT=true
+        shift 2 ;;
       --runtime)
         # Explicit runtime selection. Required in --non-interactive mode if
         # auto-detection finds both Docker and Podman (admin-must-choose rule).
@@ -2221,6 +2235,12 @@ print_platform_summary() {
   # or pre-existing env var).
   prompt_runtime_choice
 
+  # --- Licence tier (Tiago 2026-09-15) ---
+  # Asked here, next to the other admin-must-choose prompt, so both journeys
+  # resolve the tier before anything downstream reads the model or the
+  # concurrency/context pair it selects. Defaults to Community in both.
+  prompt_licence_tier
+
   # --- Multi-GPU selection (NVIDIA only; no-op for single-GPU / non-NVIDIA) ---
   # Picks the largest-VRAM card as default, shows an interactive choice when
   # more than one card is present, honours --gpu-index / YSG_GPU_INDEX.
@@ -2305,6 +2325,95 @@ _print_model_recommendations() {
     printf "    - qwen2.5:3b (inspection only), CPU inference for others\n"
   fi
   printf "\n"
+}
+
+# =============================================================================
+# Licence tier — asked at install, default Community
+# =============================================================================
+# Tiago 2026-09-15: "during the install you should ask what is the license they
+# are going for, default is Community and use the lowest size default model".
+#
+# The tier drives two things that must move together (YSG-RISK-317): the engine's
+# concurrency/per-user-context pair, and the default model.
+#
+# Qwen2.5 is Apache-2.0 EXCEPT its 3B and 72B, which are "other" (the Qwen
+# licence) — measured, not assumed:
+#     Qwen2.5-14B-Instruct  apache-2.0    Qwen2.5-7B-Instruct  apache-2.0
+#     Qwen2.5-3B-Instruct   other         Qwen2.5-72B-Instruct other
+# The shipped default was the 3B, i.e. precisely one of the two encumbered
+# sizes in that family (YSG-RISK-312), confirmed from a second source.
+#
+# EVERY model below is Apache-2.0 and ungated, verified against the HuggingFace
+# API and, for Qwen3.8, its upstream LICENSE (201 lines, stock Apache 2.0, zero
+# MAU / acceptable-use / non-commercial / research-only clauses). That is the
+# binding constraint, not size: the previous default `qwen2.5:3b` is RESEARCH-ONLY
+# and was never shippable (YSG-RISK-312), and llama3.1 carries MAU + AUP clauses
+# that fail the OSI-only rule. Community shipping a licence-encumbered model is
+# the exposure this table exists to close.
+_licence_tier_is_valid() {
+  case "$1" in
+    community|smb|enterprise|datacenter) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _pick_model_for_licence_tier — the default model for a tier.
+# Community gets the LOWEST size, per Tiago. Printed to stdout.
+_pick_model_for_licence_tier() {
+  case "${1:-community}" in
+    community)  printf "qwen3:1.7b"   ;;
+    smb)        printf "qwen2.5:14b"  ;;
+    enterprise) printf "qwen3.8:27b"  ;;
+    datacenter) printf "qwen3.8:27b"  ;;
+    *)          printf "qwen3:1.7b"   ;;
+  esac
+}
+
+# _licence_tier_from_choice — map an operator's menu answer to a tier.
+# Split out from the prompt deliberately: the prompt is gated on `[[ -t 0 ]]`,
+# so it cannot be driven from a test (a heredoc is not a TTY and the gate
+# short-circuits to the default, which silently makes such a test assert
+# nothing). Keeping the parsing pure means the branch that actually decides
+# the tier is testable, and the untestable part is reduced to the TTY gate.
+_licence_tier_from_choice() {
+  case "${1:-}" in
+    ""|1|community|Community) printf "community"  ;;
+    2|smb|SMB)                printf "smb"        ;;
+    3|enterprise|Enterprise)  printf "enterprise" ;;
+    4|datacenter|Datacenter)  printf "datacenter" ;;
+    *)
+      log_warn "unrecognised choice '${1:-}' — using Community. Re-run with --licence-tier to set it explicitly." >&2
+      printf "community"
+      ;;
+  esac
+}
+
+# prompt_licence_tier — ask once, interactively, defaulting to Community.
+# Respects the two-journey contract: --non-interactive and a non-TTY both take
+# the default silently rather than blocking an unattended install.
+prompt_licence_tier() {
+  if [[ "${LICENCE_TIER_EXPLICIT}" == "true" ]]; then
+    if ! _licence_tier_is_valid "${LICENCE_TIER}"; then
+      log_error "unknown licence tier '${LICENCE_TIER}' — expected one of: community, smb, enterprise, datacenter"
+      exit 1
+    fi
+    log_info "licence tier: ${LICENCE_TIER} (from --licence-tier)"
+    return 0
+  fi
+  if [[ ! -t 0 || "${NON_INTERACTIVE:-false}" == "true" ]]; then
+    log_info "licence tier: ${LICENCE_TIER} (default; not prompted in non-interactive mode)"
+    return 0
+  fi
+  printf "\n  ${C_BOLD}Which Yashigani licence are you installing under?${C_RESET}\n"
+  printf "    1) Community    (default)  2 concurrent users,   8k context each\n"
+  printf "    2) SMB                     8 concurrent users,   8k context each\n"
+  printf "    3) Enterprise             32 concurrent users,  16k context each\n"
+  printf "    4) Datacenter            128 concurrent users,  16k context each\n"
+  printf "  Press Enter for Community: "
+  local _choice=""
+  read -r _choice || _choice=""
+  LICENCE_TIER="$(_licence_tier_from_choice "${_choice}")"
+  log_info "licence tier: ${LICENCE_TIER} (default model: $(_pick_model_for_licence_tier "${LICENCE_TIER}"))"
 }
 
 # _pick_ollama_model_for_vram — return the best default OLLAMA_MODEL for the
@@ -3998,7 +4107,15 @@ _write_aes_key_to_env() {
   # enterprise leave it OFF; demo turns it ON to showcase the injection block.
   if [[ "$DEPLOY_MODE" == "demo" ]]; then
     _env_set "YASHIGANI_ORCH_AUTO_MODELS"  "${YASHIGANI_ORCH_AUTO_MODELS:-cloud9-orchestrate}"
-    _env_set "YASHIGANI_ORCH_BRAIN_MODEL"  "${YASHIGANI_ORCH_BRAIN_MODEL:-qwen2.5:3b}"
+    # Default follows the licence tier and is Apache-2.0 at every tier. It was
+    # `qwen2.5:3b`, which is RESEARCH-ONLY (YSG-RISK-312) and so was never
+    # shippable as a default — a licence exposure in the box, not a size choice.
+    # The tier itself, read by the Kuroshio entrypoint to set the
+    # concurrency/per-user-context pair. Written even for Community so the
+    # deployed value is explicit in .env rather than an implicit default —
+    # an operator reading .env should see which tier they are running.
+    _env_set "YSG_KUROSHIO_LICENCE_TIER"  "${LICENCE_TIER:-community}"
+    _env_set "YASHIGANI_ORCH_BRAIN_MODEL"  "${YASHIGANI_ORCH_BRAIN_MODEL:-$(_pick_model_for_licence_tier "${LICENCE_TIER}")}"
     _env_set "YASHIGANI_INSPECT_RESPONSES" "${YASHIGANI_INSPECT_RESPONSES:-true}"
     log_info "Demo mode: cloud-9 demo wired (cloud9-orchestrate model + response inspection ON)"
 
