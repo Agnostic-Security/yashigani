@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+
+import httpx
 from typing import Any, AsyncIterator, Callable
 
 from fastapi import FastAPI, HTTPException, Request
@@ -457,7 +459,31 @@ def create_app(
             if path == "chat/completions" and resolved_for_chat_guard is not None:
                 _require_chat_template(resolved_for_chat_guard)
 
-        target_url = f"{_base_url(instance.port)}/v1/{path}"
+        # Path-traversal guard. `target_url` is built by interpolation, and
+        # httpx.URL NORMALISES `../` — measured:
+        #
+        #   path="../slots/0"     -> http://host/slots/0        (escapes /v1/)
+        #   path="../../slots/0"  -> http://host/slots/0        (escapes /v1/)
+        #   path="..%2fslots%2f0" -> http://host/v1/..%2fslots%2f0  (contained)
+        #
+        # So a caller can walk out of /v1/ and reach llama-server's own control
+        # endpoints. Today that is inert: we pass neither `--slots` nor
+        # `--slot-save-path`, so those endpoints are off or 501. It stops being
+        # inert the moment `--slot-save-path` is enabled for the per-user prompt
+        # cache (YSG-RISK-315), because that flag unlocks `save` and `restore` on
+        # /slots/{id} — dump one user's KV state, load it into another user's
+        # slot. The guard lands BEFORE that flag, not after.
+        #
+        # Checked post-normalisation rather than by scanning for "..": the
+        # encoded forms above are exactly why a substring check on the raw path
+        # is the wrong test. Normalise first, then verify containment.
+        _base = _base_url(instance.port)
+        target_url = str(httpx.URL(f"{_base}/v1/{path}"))
+        if not target_url.startswith(f"{_base}/v1/"):
+            raise HTTPException(
+                status_code=400,
+                detail="invalid path: the v1 passthrough may not address anything outside /v1/",
+            )
         if request.method != "POST":
             raise HTTPException(status_code=405, detail="only POST is supported by this v1 passthrough foundation")
 
