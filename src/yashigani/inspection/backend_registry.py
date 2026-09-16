@@ -189,6 +189,31 @@ class BackendRegistry:
             backends = dict(self._all_backends)
         return {name: _safe_health_check(b) for name, b in backends.items()}
 
+    def breaker_status(self) -> dict:
+        """PING-FREE health signal for readiness probes (YSG-RISK-320).
+
+        Unlike health_status(), this makes NO network call — it reads the
+        circuit-breaker state that real inspection traffic already maintains. It
+        is therefore safe to call on every /readyz probe: probing must not add
+        load to the (single-replica) classifier it is observing, which is exactly
+        the DoS class 320 is about.
+
+        Returns {"active": <name>, "active_circuit_open": bool,
+                 "open_circuits": [names]}. `active_circuit_open` True means the
+        active backend has tripped its breaker — inspection is running on
+        fallback or failing closed, i.e. degraded — and this became visible from
+        real traffic, not from a probe.
+        """
+        with self._lock:
+            active_name = self._active_backend.name
+            all_names = list(self._all_backends)
+        open_circuits = [n for n in all_names if self._circuit_is_open(n)]
+        return {
+            "active": active_name,
+            "active_circuit_open": active_name in open_circuits,
+            "open_circuits": open_circuits,
+        }
+
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _circuit_is_open(self, name: str) -> bool:

@@ -439,6 +439,28 @@ def create_gateway_app(
                 break
 
         ready, detail = await dependency_readiness(_redis_client)
+
+        # YSG-RISK-320 (observability): surface the inspection classifier's
+        # reachability so a fleet-wide classifier outage is VISIBLE to
+        # orchestration instead of silent behind a shallow /healthz. This reads
+        # the circuit-breaker state maintained by real traffic (ping-free) — it
+        # must NOT ping the classifier on every probe, or the probe becomes part
+        # of the DoS on the single-replica backend it is observing.
+        #
+        # Deliberately REPORTED, not gated into the 503: with a single classifier
+        # replica, 503-ing every gateway on a classifier blip would stampede the
+        # whole fleet out of rotation. Whether a degraded classifier should fail
+        # readiness is an operator/scaling decision (see the 320 infra half); the
+        # bug this closes is that the outage was INVISIBLE. The signal is now in
+        # the payload and a metric can alert on it.
+        _pipeline = _state.get("inspection_pipeline")
+        _registry = getattr(_pipeline, "_backend_registry", None) if _pipeline is not None else None
+        if _registry is not None and hasattr(_registry, "breaker_status"):
+            try:
+                detail = {**detail, "inspection_classifier": _registry.breaker_status()}
+            except Exception as exc:  # observability must never break readiness
+                detail = {**detail, "inspection_classifier": {"error": str(exc)[:80]}}
+
         return JSONResponse(
             status_code=200 if ready else 503,
             content={"status": "ready" if ready else "not_ready", "checks": detail},
