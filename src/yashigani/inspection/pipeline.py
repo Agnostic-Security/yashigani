@@ -239,6 +239,7 @@ class InspectionPipeline:
         action = "DISCARDED"
         clean_query = None
         sanitized = False
+        _residual_secret_after_sanitize = None  # set if a secret survived model spans (YSG-RISK-318)
 
         if classifier_result.confidence >= self._threshold:
             # YSG-RISK-149 (fail-closed): require_spans=True means an empty
@@ -255,9 +256,27 @@ class InspectionPipeline:
                 require_spans=True,
             )
             if san.success and san.clean_query:
-                action = "SANITIZED"
-                clean_query = san.clean_query
-                sanitized = True
+                # YSG-RISK-318 (red council, Tom #6): do NOT trust the model's
+                # self-reported spans. A decoy-span response excises innocuous
+                # text and leaves the real credential in clean_query, which would
+                # then be forwarded stamped SANITIZED. Re-scan the SANITIZED
+                # OUTPUT with the DETERMINISTIC secret detector; if a secret
+                # survived the model-reported spans, DISCARD — fail closed. The
+                # disposition depends on a deterministic check, never on the
+                # model's word about what it removed.
+                from yashigani.inspection.secret_detector import scan as _secret_scan
+                residual = _secret_scan(san.clean_query)
+                if residual.is_secret:
+                    logger.warning(
+                        "request_id=%s: a secret survived model-reported sanitization "
+                        "spans (decoy-span / self-report not trusted) — discarding, "
+                        "detector=%s", request_id, residual.detector,
+                    )
+                    _residual_secret_after_sanitize = residual.audit_dict()
+                else:
+                    action = "SANITIZED"
+                    clean_query = san.clean_query
+                    sanitized = True
 
         # yashigani_inspection_sanitizations_total (metrics/registry.py) —
         # "Sanitization outcomes for CREDENTIAL_EXFIL detections."  Previously
@@ -281,6 +300,7 @@ class InspectionPipeline:
             "threshold_applied": self._threshold,
             "action_taken": action,
             "sanitized": sanitized,
+            "residual_secret_after_sanitize": _residual_secret_after_sanitize,
         }
         user_alert = _build_user_alert(request_id, action, sanitized, LABEL_CREDENTIAL_EXFIL)
 
