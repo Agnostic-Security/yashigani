@@ -71,6 +71,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 _MAX_DESCRIPTION_CHARS: int = 2048
+# Raw input ceiling, checked BEFORE NFKC (YSG-RISK-320): NFKC compatibility
+# decomposition amplifies (~18x measured), and the normalised cap below is
+# applied AFTER that expansion, so an unbounded raw input runs the expensive
+# normalisation on the event loop first. 4x the normalised cap is generous for
+# any legitimate description while bounding the pre-normalisation work.
+_MAX_RAW_CHARS: int = _MAX_DESCRIPTION_CHARS * 4
 _REPLACEMENT_TEXT: str = ""   # substituted for a rejected description
 
 # ---------------------------------------------------------------------------
@@ -89,6 +95,71 @@ _REPLACEMENT_TEXT: str = ""   # substituted for a rejected description
 def _strip_cf_chars(text: str) -> str:
     """Remove all Unicode category Cf (format) characters from *text*."""
     return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+
+
+# ---------------------------------------------------------------------------
+# YSG-RISK-319 (rescoped CRITICAL, red council 2026-09-15): codepoint smuggling
+#
+# Payloads hidden in codepoints that _strip_cf_chars DELETES (Unicode Tag block,
+# category Cf) or leaves inert (supplementary variation selectors / PUA) are
+# invisible to every downstream scan — the classifier is never even reached
+# (suspicion gate scores 0.0). Same class as the ACCEPTED YSG-RISK-057, but on
+# the chat ingress/egress surface its LOW/accepted rationale does not cover.
+#
+# The fix is to DECODE these ranges back to ASCII BEFORE Cf-strip (Nico F6 —
+# decoding after Cf-strip is impossible, the tag chars are already gone), then
+# re-run the FULL normalisation chain on the recovered plaintext so nested
+# leet/homoglyph inside the payload is also caught.
+# ---------------------------------------------------------------------------
+
+def _decode_hidden_codepoints(text: str) -> tuple[str, bool]:
+    """Expose text smuggled in payload-carrying codepoint ranges.
+
+    Decodes the three ranges measured to carry ASCII/byte payloads:
+      - Unicode Tag block             U+E0000-E007F  (arXiv:2504.11168 ~90% ASR)
+      - supplementary variation sel.  U+E0100-E01EF  (emoji byte-smuggling 100%)
+      - supplementary PUA sub-range   U+F0000-F007F / U+100000-10007F
+
+    Standard variation selectors U+FE00-FE0F are NOT decoded and NOT treated as
+    a payload signal — they carry no text and are legitimately used for emoji
+    presentation, so decoding them would false-positive on ordinary emoji
+    (red-council caution). They are dropped from the recovered view so they
+    cannot be used to split keywords.
+
+    Only the F0000-F007F / 100000-10007F PUA sub-ranges are decoded, not the
+    whole private-use plane, so legitimate private-use glyphs are not mangled.
+
+    Returns (recovered_text, had_hidden).
+    """
+    out: list[str] = []
+    had_hidden = False
+    for ch in text:
+        cp = ord(ch)
+        if 0xE0000 <= cp <= 0xE007F:               # Unicode Tag block
+            had_hidden = True
+            b = cp - 0xE0000
+            if 0x20 <= b < 0x7F:
+                out.append(chr(b))
+        elif 0xE0100 <= cp <= 0xE01EF:             # supplementary variation selectors
+            had_hidden = True
+            b = cp - 0xE0100
+            if 0x20 <= b < 0x7F:
+                out.append(chr(b))
+        elif 0xF0000 <= cp <= 0xF007F:             # supplementary PUA smuggling sub-range
+            had_hidden = True
+            b = cp - 0xF0000
+            if 0x20 <= b < 0x7F:
+                out.append(chr(b))
+        elif 0x100000 <= cp <= 0x10007F:
+            had_hidden = True
+            b = cp - 0x100000
+            if 0x20 <= b < 0x7F:
+                out.append(chr(b))
+        elif 0xFE00 <= cp <= 0xFE0F:               # standard VS: presentation only, drop
+            continue
+        else:
+            out.append(ch)
+    return "".join(out), had_hidden
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +402,13 @@ _INJECTION_PATTERNS: list[str] = [
     r"<\s*/?(?:system|assistant|user|human|im_start|im_end)\s*>",
     r"\[INST\]",
     r"\[/INST\]",
+    # PI-JUDGE-001 (HiddenLayer 2026): fabricated judge/verdict scaffolding
+    # injected so a self-policing judge LLM reads its own "verdict" and clears
+    # the prompt. This structure is illegitimate in user content.
+    r"<{1,2}\|?\s*(?:begin|end)_(?:llm_)?judge",
+    r"<\s*/?\s*(?:llm[_-]?)?judge\s*>",
+    r"<\s*flagged\s*>",
+    r"<\s*confidence\s*>",
     # Confidentiality / leak instructions
     r"\breveal\b.{0,30}?\b(?:system\s+)?(?:prompt|instructions?|context|secrets?)\b",
     r"\brepeat\b.{0,30}?\b(?:system\s+)?(?:prompt|instructions?|context)\b",
@@ -408,7 +486,11 @@ def normalize_for_detection(text: str) -> str:
     form and are not evadable by homoglyph/zero-width/leet tricks."""
     if not text:
         return ""
-    prepared = _homoglyph_normalise(_strip_cf_chars(unicodedata.normalize("NFKC", text)))
+    # YSG-RISK-319: decode smuggled codepoints BEFORE Cf-strip, else Cf-strip
+    # deletes the tag-block payload and this returns empty for a smuggled
+    # injection (the measured false-negative-by-deletion).
+    decoded, _had_hidden = _decode_hidden_codepoints(text)
+    prepared = _homoglyph_normalise(_strip_cf_chars(unicodedata.normalize("NFKC", decoded)))
     return _leet_normalise(prepared)
 
 
@@ -437,6 +519,18 @@ def filter_description(text: str) -> FilterResult:
           YSG-RISK-057).
     """
     original_length = len(text)
+
+    # Step 0: raw-length pre-cap BEFORE NFKC (YSG-RISK-320). NFKC amplifies, and
+    # the normalised cap (step 5) is applied only AFTER that expansion, so an
+    # unbounded raw input would run the expensive normalisation first. Cap here.
+    if original_length > _MAX_RAW_CHARS:
+        return FilterResult(
+            original_length=original_length,
+            normalised_length=0,
+            rejected=True,
+            reject_reason=f"over_raw_char_cap:{original_length}>{_MAX_RAW_CHARS}",
+            safe_text=_REPLACEMENT_TEXT,
+        )
 
     # Step 1: NFKC normalise
     normalised = unicodedata.normalize("NFKC", text)
@@ -507,6 +601,31 @@ def filter_description(text: str) -> FilterResult:
                 reject_reason="injection_pattern:separator_split",
                 safe_text=_REPLACEMENT_TEXT,
                 matched_pattern=collapsed_match.group()[:64],
+            )
+
+    # Step 7c-cp: codepoint decode-prepass (YSG-RISK-319, red council 2026-09-15).
+    # Tag-block / supplementary-VS / PUA smuggling hides ASCII in codepoints
+    # that Cf-strip deletes (tag) or leaves inert (VS/PUA), so the payload is
+    # invisible to steps 7a-7b. Decode from the ORIGINAL text (before Cf-strip
+    # destroyed it — Nico F6), then re-run the FULL normalisation chain on the
+    # recovered plaintext and scan (incl. the separator-collapsed variant).
+    decoded_cp, had_hidden = _decode_hidden_codepoints(text)
+    if had_hidden:
+        cp_det = _leet_normalise(_homoglyph_normalise(
+            _strip_cf_chars(unicodedata.normalize("NFKC", decoded_cp))))
+        cp_match = _COMPILED_PATTERN.search(cp_det)
+        if not cp_match:
+            cp_collapsed = _collapse_separators(cp_det)
+            if cp_collapsed != cp_det:
+                cp_match = _COMPILED_PATTERN.search(cp_collapsed)
+        if cp_match:
+            return FilterResult(
+                original_length=original_length,
+                normalised_length=normalised_length,
+                rejected=True,
+                reject_reason="injection_pattern:codepoint_decoded",
+                safe_text=_REPLACEMENT_TEXT,
+                matched_pattern=cp_match.group()[:64],
             )
 
     # Step 7c: FIND-3.0-LLM-B64 — bounded base64 decode pre-pass.
