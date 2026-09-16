@@ -111,6 +111,12 @@ Last updated: 2026-06-10
 """
 from __future__ import annotations
 
+# YSG-RISK-319 egress parity: reuse the SAME codepoint decoder the content filter
+# uses, so the smuggling ranges cannot drift between the two detectors (the
+# recurring divergence lesson — YSG-RISK-095/057/322). _content_filter does not
+# import this module, so no circular import.
+from yashigani.mcp._content_filter import _decode_hidden_codepoints
+
 import base64
 import binascii
 import hashlib
@@ -1136,6 +1142,20 @@ def scan(text: str) -> SecretVerdict:
         _run_view(dec, "hex_contiguous_decode", min_len=_REASSEMBLY_MIN_LEN,
                   reassembled=True, hex_floor=True)
         _run_reassembly_passes(dec, "hex_contiguous_decode", record=_record)
+    # Codepoint-smuggling decoded view (YSG-RISK-319 egress parity): a secret
+    # hidden in Unicode tag-block / supplementary-VS / PUA codepoints is invisible
+    # to every view above — on egress an agent could exfiltrate a key that way.
+    # Decode it (then the canonical fold + zero-width strip, but NOT leet — leet
+    # de-swap manufactures/renames chars and would mangle a secret token) and run
+    # the full battery. Uses the SAME decoder as the content filter so the ranges
+    # cannot diverge.
+    cp_decoded, cp_had_hidden = _decode_hidden_codepoints(text)
+    if cp_had_hidden:
+        cp_view = _strip_zero_width(_fold_confusables(cp_decoded))
+        _run_view(cp_view, "codepoint_decode", min_len=_ENTROPY_MIN_LEN,
+                  reassembled=True, hex_floor=True)
+        _run_reassembly_passes(cp_view, "codepoint_decode", record=_record)
+
     # Reversed view: a verbatim KNOWN-FORMAT key written backwards (AKIA…, ghp_…,
     # sk-…, PEM header).  We restrict reversed to the format regex only — NOT the
     # AWS-40-char heuristic or the entropy floor — because a reversed benign
