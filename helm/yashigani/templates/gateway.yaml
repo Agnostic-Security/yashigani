@@ -236,6 +236,12 @@ spec:
             - name: YASHIGANI_MODEL_PIN_STRICT
               value: {{ $gwEnv.modelPinStrict | quote }}
             {{- end }}
+            # YSG-RISK-320 (infra half) — opt-in only; see values.yaml
+            # gateway.env.readyzGateOnClassifier comment for the stampede risk.
+            {{- if $gwEnv.readyzGateOnClassifier }}
+            - name: YASHIGANI_READYZ_GATE_ON_CLASSIFIER
+              value: {{ $gwEnv.readyzGateOnClassifier | quote }}
+            {{- end }}
             # LAURA-ORCH-001(b): strict low budget for injection-originated
             # (tool-result justified) hops; over-budget result-steered hops are
             # refused (fail-closed).
@@ -445,12 +451,20 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 30
+          # YSG-RISK-320 (infra half): readinessProbe hits /readyz (dependency-
+          # checked — postgres+redis, and reports classifier circuit-breaker
+          # state per gateway.env.readyzGateOnClassifier above); livenessProbe
+          # stays on /healthz (shallow — process/event-loop up only), so a
+          # degraded-but-alive pod is pulled from the Service endpoints
+          # (readiness failure) rather than restarted (liveness failure) —
+          # restarting a pod fixes nothing when the dependency it's waiting on
+          # (postgres/redis/ollama) is what's actually down.
           readinessProbe:
             exec:
               command:
                 - python3
                 - -c
-                - "import ssl,urllib.request;c=ssl.create_default_context(cafile='/run/secrets/ca_root.crt');c.load_cert_chain('/run/secrets/gateway_client.crt','/run/secrets/gateway_client.key');urllib.request.urlopen('https://localhost:8080/healthz',context=c)"
+                - "import ssl,urllib.request;c=ssl.create_default_context(cafile='/run/secrets/ca_root.crt');c.load_cert_chain('/run/secrets/gateway_client.crt','/run/secrets/gateway_client.key');urllib.request.urlopen('https://localhost:8080/readyz',context=c)"
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 5
@@ -466,7 +480,7 @@ spec:
           {{- else }}
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8080
             initialDelaySeconds: 10
             periodSeconds: 15

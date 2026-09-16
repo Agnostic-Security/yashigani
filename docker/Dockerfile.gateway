@@ -129,6 +129,13 @@ EXPOSE 8081
 # Pattern A for Python ssl: trust anchor is the public ca_root.crt. Python
 # 3.14/OpenSSL 3.0 strict-chain validation rejects intermediate-only anchors
 # (gate #58a evidence, 2026-04-28). Private ca_root.key never enters workload.
+# YSG-RISK-320 (infra half): deliberately kept on /healthz (shallow liveness —
+# process up), NOT /readyz, so a standalone `docker run` of this image (no
+# compose/k8s orchestration around it) never fails its baked-in healthcheck on
+# a downstream postgres/redis/classifier dependency it may not even use.
+# docker-compose.yml's per-service `healthcheck:` OVERRIDES this with /readyz
+# for the orchestrated (compose) runtime, where readiness actually matters —
+# keep both in sync with that comment if either changes.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import ssl, urllib.request; c=ssl.create_default_context(cafile='/run/secrets/ca_root.crt'); c.load_cert_chain('/run/secrets/gateway_client.crt','/run/secrets/gateway_client.key'); urllib.request.urlopen('https://localhost:8080/healthz', context=c)"
 

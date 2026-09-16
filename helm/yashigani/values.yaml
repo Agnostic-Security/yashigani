@@ -529,6 +529,18 @@ gateway:
     #   modelPinStrict — A5 refuse gateway start on classifier startup-model pin
     #     mismatch (default unset = false = warn+continue; DEPLOY-WIRING FIX,
     #     Captain 2026-07-25 — was entirely missing from the chart)
+    #   readyzGateOnClassifier — YSG-RISK-320 (infra half): when "true", /readyz
+    #     503s while the inspection classifier's circuit breaker is open.
+    #     DEFAULT OFF ("") on purpose. At ollama.replicaCount: 1 (the chart
+    #     default), the breaker opening means TOTAL classifier exhaustion and
+    #     every gateway pod observes it near-simultaneously from the SAME
+    #     backend — flipping this on would pull the ENTIRE gateway fleet out
+    #     of Service rotation at once (full outage) on top of the per-request
+    #     fail-closed CLASSIFIER_ERROR blocking that already happens
+    #     regardless of this setting. Only set to "true" after scaling the
+    #     classifier beyond a single replica (see ollama.replicaCount /
+    #     ollama.hpa below) so an open breaker no longer implies fleet-wide
+    #     capacity loss. See src/yashigani/gateway/proxy.py readyz() comment.
     classifierMaxConcurrentPerIdentity: ""
     securityForensicCapture: ""
     conversationRisk: ""
@@ -538,6 +550,7 @@ gateway:
     audioTranscribeUrl: ""
     audioTranscribeModel: ""
     modelPinStrict: ""
+    readyzGateOnClassifier: ""
     # LAURA-ORCH-001(b): strict low budget for tool calls whose justification
     # derives from prior tool-RESULT content (injection-originated hops). An
     # over-budget result-steered hop is REFUSED so a result-steering injection
@@ -890,16 +903,32 @@ ollama:
   # correct (replicaCount: 1) as an optional overlay, but install.sh's k8s
   # path never layers it in, so every k8s install got the broken default.
   # Made the chart's baseline default itself correct rather than relying on
-  # an overlay operators may not know to pass. RESIDUAL / follow-up (not
-  # fixed here): true multi-GPU multi-replica scale-out requires
-  # ollama-init-job.yaml to pull per-pod (e.g. iterate StatefulSet pod DNS
-  # names ollama-0.<headless-svc>, ollama-1.<headless-svc>, ... instead of
-  # the round-robin Service VIP) before replicaCount > 1 is safe again.
-  # ollama.hpa.* below is NOT wired to any live HorizontalPodAutoscaler
-  # object in this chart (grepped: no HPA template exists for ollama at
-  # all) — those values are currently inert/dead config, so no separate
-  # autoscale-reintroduces-the-bug risk exists today; flagged for whoever
-  # eventually wires HPA up to also gate it on the per-pod-pull fix above.
+  # an overlay operators may not know to pass.
+  #
+  # RESIDUAL FIXED (YSG-RISK-320 infra half, Captain 2026-09-16): the
+  # per-pod pull requirement flagged above is now implemented —
+  # helm/yashigani/templates/ollama.yaml's ollama-init Job iterates every
+  # StatefulSet pod by its own per-pod DNS name (ollama-0.<headless-svc>,
+  # ollama-1.<headless-svc>, ...) and pulls+warms the model on each, instead
+  # of once against the round-robin/headless Service VIP. This makes
+  # replicaCount > 1 SAFE in CPU-mode (gpu.type: "none") deployments — it
+  # closes the council-review finding that a single unscaled classifier pod
+  # is a cheap fleet-wide DoS target (every gateway pod's concurrency guard
+  # is per-process, so effective per-identity cap scales with gateway
+  # replicas while classifier capacity did not). GPU deployments
+  # (gpu.type != "none") remain hard-clamped to 1 replica in ollama.yaml's
+  # StatefulSet template — a second replica cannot usefully hold the SAME
+  # model concurrently in the SAME one GPU's VRAM (contention, not
+  # capacity); scale those vertically via resources.limits instead.
+  #
+  # ollama.hpa.* below IS NOW WIRED to a live HorizontalPodAutoscaler
+  # (helm/yashigani/templates/ollama.yaml, gated `and hpa.enabled (eq
+  # gpu.type "none")`) — CPU-mode only, for the reason above. This is the
+  # only currently-live HPA in the whole chart: gateway.hpa.*,
+  # backoffice.hpa.*, and policy.hpa.* below are STILL dead/inert config
+  # (no HPA/ScaledObject template exists for any of them either — grepped
+  # chart-wide, 2026-09-16) and are OUT OF SCOPE for this fix; tracked as a
+  # separate follow-up, not reintroduced or masked by this change.
   replicaCount: 1
   # YSG-RISK-005 #3av: requests = 50% of limit.
   # LLM inference — high memory requirement, 2 CPUs to keep inference
@@ -925,6 +954,7 @@ ollama:
     enabled: true
     minReplicas: 1
     maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
   model: "qwen2.5:3b"
   # keepAlive: how long a loaded model stays resident in VRAM after last use.
   # -1 = never evict (recommended — cold load is 37-46s, exceeds classifier timeout).
