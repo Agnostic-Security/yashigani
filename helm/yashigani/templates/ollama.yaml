@@ -7,12 +7,38 @@
 # in values.yaml). This is the correctness prerequisite for safely running
 # ollama.replicaCount > 1 in CPU-mode (gpu.type: "none") deployments, closing
 # the single-classifier-pod availability gap the 320 council review flagged.
-# GPU deployments (gpu.type != "none") are hard-clamped to 1 replica at the
-# StatefulSet level below — a second replica cannot usefully hold the SAME
-# model concurrently in the SAME one GPU's VRAM (contention, not capacity),
-# so scaling there must be vertical (resources.limits), not horizontal.
+# GPU deployments are hard-clamped to 1 replica at the StatefulSet level
+# below — a second replica cannot usefully hold the SAME model concurrently
+# in the SAME one GPU's VRAM (contention, not capacity), so scaling there
+# must be vertical (resources.limits), not horizontal.
+#
+# GPU-mode detection (Maxine review, 2026-09-16 — PR #184): ollama.gpu.type
+# alone is NOT the only GPU-mode signal in this product. Checked for real
+# (not guessed) cross-chart couplings before adding these:
+#   - `backend` (top-level, unscoped): this key does NOT exist anywhere in
+#     THIS chart's own values.yaml/templates (grepped: zero references) — it
+#     belongs to the SEPARATE `infer/deploy/helm/yashigani-kuroshio` chart
+#     (its own Chart.yaml, its own release, `validateBackend` restricts it to
+#     cuda|rocm|vulkan there). The two charts are not coupled anywhere in
+#     install.sh today. Still checked here defensively (`.Values.backend`
+#     resolves to "" when absent — cheap, and costs nothing when unset) so an
+#     operator who reasonably reuses that chart's naming convention against
+#     THIS chart (`--set backend=cuda`) doesn't silently escape the clamp.
+#     vulkan deliberately excluded from this trigger — per this chart's own
+#     gpu.type comment below, vulkan has no implemented K8s device path yet
+#     (extraDevices not implemented) and is functionally CPU-equivalent here.
+#   - `gpu.type` (top-level, unscoped): also not a real key in this chart —
+#     checked defensively the same way, in case a values-merge ever layers
+#     one in from elsewhere.
+{{- $ollamaGpuType := .Values.ollama.gpu.type }}
+{{- $topBackend := .Values.backend | default "" }}
+{{- $topGpuType := "none" }}
+{{- if hasKey .Values "gpu" }}
+{{- $topGpuType = (.Values.gpu.type | default "none") }}
+{{- end }}
+{{- $isGpuMode := or (ne $ollamaGpuType "none") (has $topBackend (list "cuda" "rocm")) (ne $topGpuType "none") }}
 {{- $ollamaReplicas := .Values.ollama.replicaCount }}
-{{- if ne .Values.ollama.gpu.type "none" }}
+{{- if $isGpuMode }}
 {{- $ollamaReplicas = 1 }}
 {{- end }}
 {{- if .Values.ollama.enabled }}
@@ -24,11 +50,11 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-ollama") | nindent 4 }}
-  {{- if ne .Values.ollama.gpu.type "none" }}
+  {{- if $isGpuMode }}
   annotations:
     # YSG-RISK-320 / NEW-K8S-OLLAMA-REPLICA-MODEL-ASYMMETRY-001: replicaCount
-    # clamped to 1 because gpu.type={{ .Values.ollama.gpu.type }} (values.yaml
-    # requested: {{ .Values.ollama.replicaCount }}). See ollama.yaml header comment.
+    # clamped to 1. Trigger(s): ollama.gpu.type={{ $ollamaGpuType }}{{ if ne $topBackend "" }}, backend={{ $topBackend }}{{ end }}{{ if ne $topGpuType "none" }}, gpu.type={{ $topGpuType }}{{ end }}
+    # (values.yaml requested ollama.replicaCount: {{ .Values.ollama.replicaCount }}). See ollama.yaml header comment.
     yashigani.io/replica-clamp-reason: "gpu-single-model-vram-contention"
   {{- end }}
 spec:
@@ -331,19 +357,21 @@ spec:
             medium: Memory
             sizeLimit: 512Mi
 {{- end }}
-{{- if and .Values.ollama.enabled .Values.ollama.hpa.enabled (eq .Values.ollama.gpu.type "none") }}
+{{- if and .Values.ollama.enabled .Values.ollama.hpa.enabled (not $isGpuMode) }}
 ---
 # YSG-RISK-320 (infra half): the LIVE HorizontalPodAutoscaler that
 # ollama.hpa.* previously described but never created (grepped: no HPA
 # template existed for ollama at all — council review, 2026-09-15). CPU-mode
-# only (gpu.type: "none") — on a single-GPU deployment a second replica
-# cannot usefully hold the SAME model concurrently in the SAME GPU's VRAM
-# (contention, not capacity), so this is hard-gated off whenever
-# ollama.gpu.type is set; scale those deployments vertically instead
-# (ollama.resources.limits). Safe to enable in CPU mode now that the
-# ollama-init Job above pulls+warms the model on every replica individually
-# (NEW-K8S-OLLAMA-REPLICA-MODEL-ASYMMETRY-001 fix, same commit) — before that
-# fix, scaling out left newly-added replicas with an empty model catalog.
+# only ($isGpuMode false — see the GPU-mode detection comment above the
+# StatefulSet: ollama.gpu.type, top-level backend in cuda/rocm, or top-level
+# gpu.type) — on a single-GPU deployment a second replica cannot usefully
+# hold the SAME model concurrently in the SAME GPU's VRAM (contention, not
+# capacity), so this is hard-gated off whenever any GPU-mode signal fires;
+# scale those deployments vertically instead (ollama.resources.limits). Safe
+# to enable in CPU mode now that the ollama-init Job above pulls+warms the
+# model on every replica individually (NEW-K8S-OLLAMA-REPLICA-MODEL-ASYMMETRY-001
+# fix, same commit) — before that fix, scaling out left newly-added replicas
+# with an empty model catalog.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
