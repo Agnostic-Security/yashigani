@@ -11,10 +11,11 @@ exploitable, and it took a corrected test to find the real one:
      "passes" whether or not the fix is present (the first version of this test
      was a fake-green; the re-scan mutation did not bite).
   2. But the CredentialMasker and the deterministic secret_detector have
-     DIFFERENT coverage. Measured: secret_detector flags Slack (`xoxb-`) and
-     Google (`AIzaSy`) tokens that the masker does NOT mask. Such a secret
-     survives masking, so a decoy/incomplete-span model response forwards it in
-     clean_query stamped SANITIZED.
+     DIFFERENT coverage. The plaintext provider gaps (Slack/Google) were closed
+     in YSG-RISK-322, but the detector's DECODERS (base32/hex/reassembly) still
+     see through obfuscated secrets the masker's literal patterns cannot. Such a
+     secret survives masking, so a decoy/incomplete-span model response forwards
+     it in clean_query stamped SANITIZED.
 
 Fix: after sanitize(), re-scan the SANITIZED OUTPUT with secret_detector; if a
 secret survived (masker-gap or model decoy spans), DISCARD. The disposition
@@ -26,21 +27,27 @@ removing it lets the secret through (mutation bites).
 
 from __future__ import annotations
 
+import base64
 from unittest.mock import MagicMock
 
 from yashigani.inspection.classifier import ClassifierResult
 from yashigani.inspection.pipeline import InspectionPipeline
 from yashigani.inspection.secret_detector import scan
 
-# A Slack-bot-token-SHAPED secret: flagged by secret_detector, MISSED by the
-# CredentialMasker (measured coverage gap) — this is what makes the re-scan
-# load-bearing rather than redundant with masking.
+# A DURABLE masker gap: a base32-ENCODED secret. The deterministic
+# secret_detector decodes base32 and catches the AWS key inside; the masker's
+# literal vendor-format patterns structurally cannot decode it, so it survives
+# masking. This is what makes the re-scan load-bearing.
 #
-# ASSEMBLED from fragments at runtime, and the "xoxb" prefix is itself split, so
-# no provider-token literal appears anywhere in this source file. GitHub push
-# protection (correctly) blocks a literal Slack token even a synthetic one; the
-# runtime value is identical, so scan()/masker behaviour is unchanged.
-_GAP_SECRET = "-".join(["xo" + "xb", "1" * 12, "1" * 13, "A" * 24])
+# Chosen deliberately over a plaintext provider token: once YSG-RISK-322 brought
+# the masker up to the detector's PLAINTEXT coverage (Slack/Google/etc.), a
+# plaintext token no longer survives masking and could not demonstrate the
+# re-scan. Obfuscated (base32/reassembled) secrets remain a genuine gap — the
+# detector's decoders see through them, the masker's literal patterns do not.
+#
+# Built at runtime from the canonical AWS documentation DUMMY key, base32-encoded,
+# so no secret literal appears in this source and nothing trips push protection.
+_GAP_SECRET = base64.b32encode(("AKIA" + "IOSFODNN7EXAMPLE").encode()).decode().rstrip("=")
 
 
 def _assert_masker_gap_precondition() -> None:
@@ -48,9 +55,9 @@ def _assert_masker_gap_precondition() -> None:
     become a fake-green (the secret would be gone before sanitize). Fail loudly
     instead so the test is rewritten with a still-uncovered secret."""
     pl = InspectionPipeline(classifier=MagicMock(), sanitize_threshold=0.85)
-    assert scan(_GAP_SECRET).is_secret, "secret_detector no longer flags the token"
+    assert scan(_GAP_SECRET).is_secret, "secret_detector no longer decodes/flags the token"
     assert _GAP_SECRET in pl._masker.mask_string(_GAP_SECRET), (
-        "masker now covers the token — pick a different masker-gap secret or this "
+        "masker now covers this obfuscated form — pick a still-uncovered gap or this "
         "test is a fake-green"
     )
 

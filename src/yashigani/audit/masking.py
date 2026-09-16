@@ -177,6 +177,16 @@ _PATTERNS: list[tuple[re.Pattern, Any]] = [
     # GitHub personal access token — whole match is the secret.
     (re.compile(r'ghp_[A-Za-z0-9]{36}'),
      _fingerprint_whole_match),
+    # GitHub fine-grained PAT — sibling of ghp_, was also missed (YSG-RISK-322).
+    (re.compile(r'github_pat_[A-Za-z0-9_]{22,}'),
+     _fingerprint_whole_match),
+    # Slack tokens (bot/user/app/refresh) — YSG-RISK-322: secret_detector flagged
+    # these but the masker missed them, so they forwarded unmasked on CLEAN/PASS.
+    (re.compile(r'xox[baprs]-[A-Za-z0-9-]{10,}'),
+     _fingerprint_whole_match),
+    # Google API key — YSG-RISK-322: same measured masker/detector gap.
+    (re.compile(r'AIza[0-9A-Za-z_-]{35}'),
+     _fingerprint_whole_match),
     # GitLab PAT — whole match is the secret.
     (re.compile(r'glpat-[A-Za-z0-9\-]{20,}'),
      _fingerprint_whole_match),
