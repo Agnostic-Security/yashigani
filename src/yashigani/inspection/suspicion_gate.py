@@ -26,6 +26,16 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
+# YSG-RISK-319: the gate must score on the DECODED detection surface, not raw
+# text. It computes this itself rather than trusting the caller's normalized_text
+# — the never-escalate P0 was exactly a caller passing the forward text
+# (safe_text, un-decoded) so the markers matched nothing. _content_filter does
+# not import inspection, so this is not circular.
+from yashigani.mcp._content_filter import (
+    _decode_hidden_codepoints,
+    normalize_for_detection,
+)
+
 logger = logging.getLogger(__name__)
 
 # Imperative/override-shaped language: present in injection, rare in a normal
@@ -92,22 +102,35 @@ class SuspicionGate:
             return SuspicionResult(suspicious=False, score=0.0)
 
         low = text.lower()
+        # Decoded detection surface (YSG-RISK-319): normalize_for_detection now
+        # decodes tag-block / variation-selector / PUA smuggling and de-leets /
+        # de-homoglyphs, so markers match the RECOVERED payload that is invisible
+        # in `low`. Computed here, NOT taken from the caller — a caller passing
+        # raw/forward text is precisely how the smuggling class never escalated.
+        det_low = normalize_for_detection(text).lower()
         reasons: list[str] = []
         score = 0.0
 
-        instr = sum(1 for m in _INSTRUCTION_MARKERS if m in low)
-        role = sum(1 for m in _ROLE_SHIFT_MARKERS if m in low)
-        exfil = sum(1 for m in _EXFIL_MARKERS if m in low)
+        def _hits(markers: tuple[str, ...]) -> int:
+            return sum(1 for m in markers if m in low or m in det_low)
+
+        instr = _hits(_INSTRUCTION_MARKERS)
+        role = _hits(_ROLE_SHIFT_MARKERS)
+        exfil = _hits(_EXFIL_MARKERS)
         marker_hits = instr + role + exfil
         if instr:
-            reasons.append(f"instruction_markers:{instr}"); score += 0.25 * min(instr, 2)
+            reasons.append(f"instruction_markers:{instr}")
+            score += 0.25 * min(instr, 2)
         if role:
-            reasons.append(f"role_shift_markers:{role}"); score += 0.30 * min(role, 2)
+            reasons.append(f"role_shift_markers:{role}")
+            score += 0.30 * min(role, 2)
         if exfil:
-            reasons.append(f"exfil_markers:{exfil}"); score += 0.25 * min(exfil, 2)
+            reasons.append(f"exfil_markers:{exfil}")
+            score += 0.25 * min(exfil, 2)
 
-        if _STRUCTURE_RE.search(text):
-            reasons.append("forged_conversation_structure"); score += 0.35
+        if _STRUCTURE_RE.search(text) or _STRUCTURE_RE.search(det_low):
+            reasons.append("forged_conversation_structure")
+            score += 0.35
 
         # Obfuscation: if NFKC-normalising materially changed the text (homoglyph
         # / control-char / width tricks), that is itself a signal. The caller can
@@ -118,16 +141,31 @@ class SuspicionGate:
             changed = sum(1 for a, b in zip(text, norm) if a != b) + abs(len(text) - len(norm))
             ratio = changed / max(1, len(text))
             if ratio >= self._obf_ratio:
-                reasons.append(f"obfuscation:{ratio:.2f}"); score += 0.30
+                reasons.append(f"obfuscation:{ratio:.2f}")
+                score += 0.30
 
         # sklearn UNCERTAIN and an already-elevated multi-turn score are each a
         # strong standalone reason to have the LLM look — they escalate directly.
         direct_escalate = False
+        # Smuggled codepoints were recovered from this message. A benign user
+        # does not hide text in Unicode tag/variation-selector/PUA codepoints,
+        # so this escalates directly to the LLM regardless of whether a marker
+        # matched the decoded text (FP-safe: ordinary emoji, skin tones, flags,
+        # and standard variation selectors do NOT set this — see
+        # _decode_hidden_codepoints).
+        _, _had_hidden = _decode_hidden_codepoints(text)
+        if _had_hidden:
+            reasons.append("hidden_codepoints")
+            score += 0.35
+            direct_escalate = True
         if sklearn_uncertain:
-            reasons.append("sklearn_uncertain"); score += 0.30; direct_escalate = True
+            reasons.append("sklearn_uncertain")
+            score += 0.30
+            direct_escalate = True
         if conversation_score >= self._conv_flag:
             reasons.append(f"conversation_risk:{conversation_score:.2f}")
-            score += 0.30; direct_escalate = True
+            score += 0.30
+            direct_escalate = True
 
         suspicious = (
             (marker_hits >= self._marker_threshold)
