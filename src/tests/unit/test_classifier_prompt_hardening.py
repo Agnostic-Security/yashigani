@@ -77,3 +77,28 @@ def test_every_registry_backend_wraps_content() -> None:
         "build_user_message(content), losing data/instruction separation: "
         + ", ".join(offenders)
     )
+
+
+# --- IRIS-CPS-06: the two classifier prompts must not diverge on hardening ----
+
+
+def test_both_classifier_prompts_carry_the_same_security_hardening() -> None:
+    """There are two prompts by necessity — the legacy classifier.py emits spans
+    for the sanitizer, the shared classification_prompt.py emits `reason`. Their
+    OUTPUT schemas differ, but their SECURITY hardening must not: the original
+    bug was exactly the backend_registry path running an unhardened copy while
+    the legacy one was hardened. This pins the security-critical content of both.
+
+    Not a full merge (the schemas legitimately differ); a drift guard on the
+    invariants that must never diverge.
+    """
+    from yashigani.inspection.classifier import _SYSTEM_PROMPT as legacy
+
+    for name, prompt in (("shared", SYSTEM_PROMPT), ("legacy", legacy)):
+        low = prompt.lower()
+        assert "untrusted" in low, f"{name}: missing untrusted-data framing"
+        assert "never" in low and "instruction" in low, f"{name}: missing never-instructions"
+        assert "judge" in low or "flagged" in low, f"{name}: missing fabricated-judge clause"
+        assert USER_CONTENT_START in prompt and USER_CONTENT_END in prompt, (
+            f"{name}: missing USER_CONTENT delimiters"
+        )
