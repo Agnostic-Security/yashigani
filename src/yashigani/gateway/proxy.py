@@ -455,11 +455,35 @@ def create_gateway_app(
         # the payload and a metric can alert on it.
         _pipeline = _state.get("inspection_pipeline")
         _registry = getattr(_pipeline, "_backend_registry", None) if _pipeline is not None else None
+        _classifier_status: dict | None = None
         if _registry is not None and hasattr(_registry, "breaker_status"):
             try:
-                detail = {**detail, "inspection_classifier": _registry.breaker_status()}
+                _classifier_status = _registry.breaker_status()
+                detail = {**detail, "inspection_classifier": _classifier_status}
             except Exception as exc:  # observability must never break readiness
                 detail = {**detail, "inspection_classifier": {"error": str(exc)[:80]}}
+
+        # YSG-RISK-320 (infra half) — OPT-IN gate, default OFF. Gating readiness
+        # on classifier-degraded is only safe once the classifier backend has
+        # real redundancy (see helm/yashigani/values.yaml ollama.replicaCount /
+        # ollama.hpa — task 2 of this finding). At replicaCount=1 the breaker
+        # opening means TOTAL classifier exhaustion, and every gateway replica
+        # observes the SAME breaker state from the SAME shared backend at
+        # (roughly) the same time — 503-ing readiness on that would pull the
+        # ENTIRE gateway fleet out of rotation simultaneously (a self-inflicted
+        # full outage, on top of the fail-closed CLASSIFIER_ERROR blocking that
+        # already happens per-request) rather than the narrower "escalated
+        # inspection is degraded" signal this endpoint already reports. Operator
+        # must explicitly opt in via YASHIGANI_READYZ_GATE_ON_CLASSIFIER=true —
+        # and should only do so after confirming classifier redundancy, i.e.
+        # ollama scaled beyond a single replica so a lone pod's circuit tripping
+        # no longer implies fleet-wide capacity loss.
+        _gate_on_classifier = (
+            os.getenv("YASHIGANI_READYZ_GATE_ON_CLASSIFIER", "false").strip().lower() == "true"
+        )
+        if _gate_on_classifier and ready and _classifier_status is not None:
+            if _classifier_status.get("active_circuit_open"):
+                ready = False
 
         return JSONResponse(
             status_code=200 if ready else 503,

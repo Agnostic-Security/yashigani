@@ -798,6 +798,14 @@ services:
       # Doc default: pin off until bootstrapped (false = warn+continue, log
       # CRITICAL + MODEL_INTEGRITY_MISMATCH audit; does not block start).
       YASHIGANI_MODEL_PIN_STRICT: ${YASHIGANI_MODEL_PIN_STRICT:-false}
+      # YSG-RISK-320 (infra half) — opt-in only, default false. /readyz reports
+      # inspection_classifier.active_circuit_open unconditionally; this flag
+      # additionally 503s readiness on it when true. Single-replica ollama
+      # (the compose default) means an open breaker = total classifier
+      # exhaustion observed near-simultaneously by every gateway container —
+      # flipping this on would pull the whole fleet out of rotation at once.
+      # See src/yashigani/gateway/proxy.py readyz() comment before enabling.
+      YASHIGANI_READYZ_GATE_ON_CLASSIFIER: ${YASHIGANI_READYZ_GATE_ON_CLASSIFIER:-false}
       # Multi-turn conversational-injection accumulator. Doc default: on.
       YASHIGANI_CONVERSATION_RISK: ${YASHIGANI_CONVERSATION_RISK:-true}
       # LLM→mechanical rule-promotion learning loop. Doc default: on.
@@ -984,10 +992,22 @@ services:
       extractor-svc:
         condition: service_healthy
     healthcheck:
-      # mTLS port now used — healthcheck uses the client cert inside the
-      # container. Pattern A for Python ssl: trust anchor is the public ca_root.crt
+      # YSG-RISK-320 (infra half, Captain 2026-09-16): switched from /healthz
+      # to /readyz. This compose-level healthcheck is what `depends_on:
+      # condition: service_healthy` gates on (langflow/letta/openclaw wait on
+      # gateway here) and what `docker/podman ps` reports — i.e. it is the
+      # READINESS signal for this runtime, not liveness. /healthz stays a
+      # shallow liveness probe (process up) and remains the Dockerfile-baked
+      # HEALTHCHECK (docker/Dockerfile.gateway) for standalone/non-compose
+      # runs. /readyz additionally checks postgres+redis reachability and
+      # reports (does not yet gate on, see YASHIGANI_READYZ_GATE_ON_CLASSIFIER
+      # above) inspection-classifier circuit-breaker state — a degraded
+      # instance is now visible to `docker compose ps` / dependents instead of
+      # reporting healthy while blocking 100% of escalated inspection traffic.
+      # mTLS port — healthcheck uses the client cert inside the container.
+      # Pattern A for Python ssl: trust anchor is the public ca_root.crt
       # (Py 3.12/OpenSSL 3.0 strict-chain rejects intermediate-only — gate #58a).
-      test: ["CMD-SHELL", "python3 -c \"import ssl, urllib.request; c=ssl.create_default_context(cafile='/run/secrets/ca_root.crt'); c.load_cert_chain('/run/secrets/gateway_client.crt','/run/secrets/gateway_client.key'); urllib.request.urlopen('https://localhost:8080/healthz', context=c)\""]
+      test: ["CMD-SHELL", "python3 -c \"import ssl, urllib.request; c=ssl.create_default_context(cafile='/run/secrets/ca_root.crt'); c.load_cert_chain('/run/secrets/gateway_client.crt','/run/secrets/gateway_client.key'); urllib.request.urlopen('https://localhost:8080/readyz', context=c)\""]
       interval: 15s
       timeout: 5s
       retries: 5

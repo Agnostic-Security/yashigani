@@ -1,5 +1,46 @@
 # last-updated: 2026-05-19T00:00:00+01:00 (fix(helm): ollama-init Job — also triggered by agentBundles langflow/letta/openclaw — close SF-011)
 # last-updated: 2026-05-17T15:45:00+01:00 (fix: ollama-init Job — busybox initContainer + NetworkPolicy ingress + egress for Job pod)
+# last-updated: 2026-09-16T00:00:00+00:00 (fix(helm): YSG-RISK-320 infra half —
+# ollama-init Job now pulls+warms the model on EVERY StatefulSet replica pod
+# (was: single `ollama pull` against the aggregate headless Service, which
+# lands on exactly one pod — see NEW-K8S-OLLAMA-REPLICA-MODEL-ASYMMETRY-001
+# in values.yaml). This is the correctness prerequisite for safely running
+# ollama.replicaCount > 1 in CPU-mode (gpu.type: "none") deployments, closing
+# the single-classifier-pod availability gap the 320 council review flagged.
+# GPU deployments are hard-clamped to 1 replica at the StatefulSet level
+# below — a second replica cannot usefully hold the SAME model concurrently
+# in the SAME one GPU's VRAM (contention, not capacity), so scaling there
+# must be vertical (resources.limits), not horizontal.
+#
+# GPU-mode detection (Maxine review, 2026-09-16 — PR #184): ollama.gpu.type
+# alone is NOT the only GPU-mode signal in this product. Checked for real
+# (not guessed) cross-chart couplings before adding these:
+#   - `backend` (top-level, unscoped): this key does NOT exist anywhere in
+#     THIS chart's own values.yaml/templates (grepped: zero references) — it
+#     belongs to the SEPARATE `infer/deploy/helm/yashigani-kuroshio` chart
+#     (its own Chart.yaml, its own release, `validateBackend` restricts it to
+#     cuda|rocm|vulkan there). The two charts are not coupled anywhere in
+#     install.sh today. Still checked here defensively (`.Values.backend`
+#     resolves to "" when absent — cheap, and costs nothing when unset) so an
+#     operator who reasonably reuses that chart's naming convention against
+#     THIS chart (`--set backend=cuda`) doesn't silently escape the clamp.
+#     vulkan deliberately excluded from this trigger — per this chart's own
+#     gpu.type comment below, vulkan has no implemented K8s device path yet
+#     (extraDevices not implemented) and is functionally CPU-equivalent here.
+#   - `gpu.type` (top-level, unscoped): also not a real key in this chart —
+#     checked defensively the same way, in case a values-merge ever layers
+#     one in from elsewhere.
+{{- $ollamaGpuType := .Values.ollama.gpu.type }}
+{{- $topBackend := .Values.backend | default "" }}
+{{- $topGpuType := "none" }}
+{{- if hasKey .Values "gpu" }}
+{{- $topGpuType = (.Values.gpu.type | default "none") }}
+{{- end }}
+{{- $isGpuMode := or (ne $ollamaGpuType "none") (has $topBackend (list "cuda" "rocm")) (ne $topGpuType "none") }}
+{{- $ollamaReplicas := .Values.ollama.replicaCount }}
+{{- if $isGpuMode }}
+{{- $ollamaReplicas = 1 }}
+{{- end }}
 {{- if .Values.ollama.enabled }}
 ---
 apiVersion: apps/v1
@@ -9,9 +50,16 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-ollama") | nindent 4 }}
+  {{- if $isGpuMode }}
+  annotations:
+    # YSG-RISK-320 / NEW-K8S-OLLAMA-REPLICA-MODEL-ASYMMETRY-001: replicaCount
+    # clamped to 1. Trigger(s): ollama.gpu.type={{ $ollamaGpuType }}{{ if ne $topBackend "" }}, backend={{ $topBackend }}{{ end }}{{ if ne $topGpuType "none" }}, gpu.type={{ $topGpuType }}{{ end }}
+    # (values.yaml requested ollama.replicaCount: {{ .Values.ollama.replicaCount }}). See ollama.yaml header comment.
+    yashigani.io/replica-clamp-reason: "gpu-single-model-vram-contention"
+  {{- end }}
 spec:
   serviceName: yashigani-ollama
-  replicas: {{ .Values.ollama.replicaCount }}
+  replicas: {{ $ollamaReplicas }}
   selector:
     matchLabels:
       app.kubernetes.io/name: yashigani-ollama
@@ -181,10 +229,17 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              until wget -q -O- http://yashigani-ollama:11434/api/tags >/dev/null 2>&1; do
-                echo "waiting for yashigani-ollama:11434..."; sleep 5
+              # YSG-RISK-320: wait for EVERY StatefulSet pod individually by its
+              # own per-pod DNS name, not just the aggregate headless Service
+              # (which is satisfied by ANY one pod and would let the pull loop
+              # below race ahead of not-yet-ready higher-ordinal pods).
+              {{- range $i := until (int $ollamaReplicas) }}
+              POD_HOST="yashigani-ollama-{{ $i }}.yashigani-ollama.{{ $.Release.Namespace }}.svc.cluster.local"
+              until wget -q -O- "http://${POD_HOST}:11434/api/tags" >/dev/null 2>&1; do
+                echo "waiting for ${POD_HOST}:11434..."; sleep 5
               done
-              echo "ollama is reachable"
+              echo "${POD_HOST} is reachable"
+              {{- end }}
           resources:
             requests:
               cpu: "50m"
@@ -222,51 +277,70 @@ spec:
                 echo "Skipping model pull. Free space on the PVC and re-deploy."
                 exit 0
               fi
-              # SF-QWEN-001 (ordering fix): pull qwen2.5:3b FIRST, unconditionally,
-              # before any digest check on the VRAM-tier primary model. A stale
-              # digest on the primary must not block the agent base model pull.
-              if [ "${OLLAMA_MODEL}" != "qwen2.5:3b" ]; then
-                echo "Pulling required base model: qwen2.5:3b (agent/gateway dependency — SF-QWEN-001)"
-                OLLAMA_HOST=http://yashigani-ollama:11434 ollama pull "qwen2.5:3b"
-                echo "Base model pull complete: qwen2.5:3b"
-              fi
-              echo "Disk OK. Pulling ${OLLAMA_MODEL}..."
-              OLLAMA_HOST=http://yashigani-ollama:11434 ollama pull "${OLLAMA_MODEL}"
-              # DIGEST POLICY: default is "skip" (see values.yaml ollama.initJob.modelDigest).
-              # A mismatch is a loud WARNING, never exit 1. See compose counterpart comment.
-              EXPECTED_DIGEST="${OLLAMA_MODEL_DIGEST:-skip}"
-              ACTUAL_DIGEST=$(OLLAMA_HOST=http://yashigani-ollama:11434 ollama list | grep "${OLLAMA_MODEL}" | awk '{print $2}')
-              if [ -n "$EXPECTED_DIGEST" ] && [ "$EXPECTED_DIGEST" != "skip" ]; then
-                if echo "$ACTUAL_DIGEST" | grep -q "$EXPECTED_DIGEST"; then
-                  echo "Digest verified: $ACTUAL_DIGEST"
-                else
-                  echo "###############################################################"
-                  echo "WARNING: Model digest mismatch (SOL-SC-03)"
-                  echo "  Model:    ${OLLAMA_MODEL}"
-                  echo "  Expected: $EXPECTED_DIGEST"
-                  echo "  Actual:   $ACTUAL_DIGEST"
-                  echo "This model was updated upstream. Review the change and update"
-                  echo "ollama.initJob.modelDigest in values.yaml to the new digest,"
-                  echo "or set it to 'skip' to silence this warning."
-                  echo "Continuing with the pulled model (Job not aborted)."
-                  echo "###############################################################"
+              # YSG-RISK-320 (NEW-K8S-OLLAMA-REPLICA-MODEL-ASYMMETRY-001 fix):
+              # pull+verify+warm the model on EVERY StatefulSet pod individually
+              # via its own per-pod DNS name, instead of once against the
+              # aggregate headless Service (which only ever reaches ONE pod and
+              # left every other replica's PVC with an empty model catalog).
+              # With replicaCount=1 (default) this loop runs exactly once —
+              # byte-identical behaviour to before. It only changes anything
+              # once an operator raises ollama.replicaCount in a CPU-mode
+              # (gpu.type: "none") deployment.
+              pull_and_warm() {
+                local OLLAMA_HOST_URL="$1"
+                # SF-QWEN-001 (ordering fix): pull qwen2.5:3b FIRST, unconditionally,
+                # before any digest check on the VRAM-tier primary model. A stale
+                # digest on the primary must not block the agent base model pull.
+                if [ "${OLLAMA_MODEL}" != "qwen2.5:3b" ]; then
+                  echo "[${OLLAMA_HOST_URL}] Pulling required base model: qwen2.5:3b (agent/gateway dependency — SF-QWEN-001)"
+                  OLLAMA_HOST="${OLLAMA_HOST_URL}" ollama pull "qwen2.5:3b"
+                  echo "[${OLLAMA_HOST_URL}] Base model pull complete: qwen2.5:3b"
                 fi
-              fi
-              echo "Model pull complete: ${OLLAMA_MODEL}"
-              # WARMUP-001: prime the pulled model into VRAM with keep_alive:-1 so the
-              # first real request (classifier or route) is warm. Cold-load penalty is
-              # 37-46s — exceeds both classifier 10s timeout and Caddy write timeout.
-              # Non-fatal: warmup failure warns but does not fail the Job.
-              echo "Warming ${OLLAMA_MODEL} into VRAM (keep_alive:-1)..."
-              PAYLOAD="{\"model\":\"${OLLAMA_MODEL}\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":-1}"
-              PAYLOAD_LEN=$(printf '%s' "$PAYLOAD" | wc -c)
-              {
-                printf 'POST /api/generate HTTP/1.0\r\nHost: yashigani-ollama\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s' \
-                  "$PAYLOAD_LEN" "$PAYLOAD"
-              } >/dev/tcp/yashigani-ollama/11434 2>/dev/null && \
-              cat /dev/tcp/yashigani-ollama/11434 2>/dev/null | tail -1 && \
-              echo "Warmup complete: ${OLLAMA_MODEL}" || \
-              echo "WARNING: warmup returned non-zero — first request may be slow (non-fatal)"
+                echo "[${OLLAMA_HOST_URL}] Disk OK. Pulling ${OLLAMA_MODEL}..."
+                OLLAMA_HOST="${OLLAMA_HOST_URL}" ollama pull "${OLLAMA_MODEL}"
+                # DIGEST POLICY: default is "skip" (see values.yaml ollama.initJob.modelDigest).
+                # A mismatch is a loud WARNING, never exit 1. See compose counterpart comment.
+                EXPECTED_DIGEST="${OLLAMA_MODEL_DIGEST:-skip}"
+                ACTUAL_DIGEST=$(OLLAMA_HOST="${OLLAMA_HOST_URL}" ollama list | grep "${OLLAMA_MODEL}" | awk '{print $2}')
+                if [ -n "$EXPECTED_DIGEST" ] && [ "$EXPECTED_DIGEST" != "skip" ]; then
+                  if echo "$ACTUAL_DIGEST" | grep -q "$EXPECTED_DIGEST"; then
+                    echo "[${OLLAMA_HOST_URL}] Digest verified: $ACTUAL_DIGEST"
+                  else
+                    echo "###############################################################"
+                    echo "WARNING: Model digest mismatch (SOL-SC-03) on ${OLLAMA_HOST_URL}"
+                    echo "  Model:    ${OLLAMA_MODEL}"
+                    echo "  Expected: $EXPECTED_DIGEST"
+                    echo "  Actual:   $ACTUAL_DIGEST"
+                    echo "This model was updated upstream. Review the change and update"
+                    echo "ollama.initJob.modelDigest in values.yaml to the new digest,"
+                    echo "or set it to 'skip' to silence this warning."
+                    echo "Continuing with the pulled model (Job not aborted)."
+                    echo "###############################################################"
+                  fi
+                fi
+                echo "[${OLLAMA_HOST_URL}] Model pull complete: ${OLLAMA_MODEL}"
+                # WARMUP-001: prime the pulled model into VRAM with keep_alive:-1 so
+                # the first real request (classifier or route) hitting THIS pod is
+                # warm. Cold-load penalty is 37-46s — exceeds both classifier 10s
+                # timeout and Caddy write timeout. Non-fatal: warmup failure warns
+                # but does not fail the Job. Per-pod (YSG-RISK-320): warming only
+                # the aggregate service target left every other replica cold.
+                local HOST_PART="${OLLAMA_HOST_URL#http://}"
+                HOST_PART="${HOST_PART%%:*}"
+                echo "[${OLLAMA_HOST_URL}] Warming ${OLLAMA_MODEL} into VRAM (keep_alive:-1)..."
+                PAYLOAD="{\"model\":\"${OLLAMA_MODEL}\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":-1}"
+                PAYLOAD_LEN=$(printf '%s' "$PAYLOAD" | wc -c)
+                {
+                  printf 'POST /api/generate HTTP/1.0\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s' \
+                    "$HOST_PART" "$PAYLOAD_LEN" "$PAYLOAD"
+                } >/dev/tcp/"$HOST_PART"/11434 2>/dev/null && \
+                cat /dev/tcp/"$HOST_PART"/11434 2>/dev/null | tail -1 && \
+                echo "[${OLLAMA_HOST_URL}] Warmup complete: ${OLLAMA_MODEL}" || \
+                echo "WARNING: warmup on ${OLLAMA_HOST_URL} returned non-zero — first request to this pod may be slow (non-fatal)"
+              }
+              {{- range $i := until (int $ollamaReplicas) }}
+              pull_and_warm "http://yashigani-ollama-{{ $i }}.yashigani-ollama.{{ $.Release.Namespace }}.svc.cluster.local:11434"
+              {{- end }}
           resources:
             {{- toYaml .Values.ollama.initJob.resources | nindent 12 }}
           volumeMounts:
@@ -282,4 +356,46 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 512Mi
+{{- end }}
+{{- if and .Values.ollama.enabled .Values.ollama.hpa.enabled (not $isGpuMode) }}
+---
+# YSG-RISK-320 (infra half): the LIVE HorizontalPodAutoscaler that
+# ollama.hpa.* previously described but never created (grepped: no HPA
+# template existed for ollama at all — council review, 2026-09-15). CPU-mode
+# only ($isGpuMode false — see the GPU-mode detection comment above the
+# StatefulSet: ollama.gpu.type, top-level backend in cuda/rocm, or top-level
+# gpu.type) — on a single-GPU deployment a second replica cannot usefully
+# hold the SAME model concurrently in the SAME GPU's VRAM (contention, not
+# capacity), so this is hard-gated off whenever any GPU-mode signal fires;
+# scale those deployments vertically instead (ollama.resources.limits). Safe
+# to enable in CPU mode now that the ollama-init Job above pulls+warms the
+# model on every replica individually (NEW-K8S-OLLAMA-REPLICA-MODEL-ASYMMETRY-001
+# fix, same commit) — before that fix, scaling out left newly-added replicas
+# with an empty model catalog.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: yashigani-ollama
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "yashigani.componentLabels" (dict "root" . "name" "yashigani-ollama") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: yashigani-ollama
+  minReplicas: {{ .Values.ollama.hpa.minReplicas }}
+  maxReplicas: {{ .Values.ollama.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.ollama.hpa.targetCPUUtilizationPercentage | default 70 }}
+  # Conservative scale-down: a cold-loaded model costs 37-46s (WARMUP-001) —
+  # don't thrash replicas away the moment CPU dips.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
 {{- end }}
